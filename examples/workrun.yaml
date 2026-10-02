@@ -1,0 +1,7 @@
+version: 1
+
+tasks:
+  test:
+    description: Run the Workrun test suite
+    command: ["go", "test", "./..."]
+    dir: ..
