@@ -11,7 +11,6 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/zishan044/workrun/internal/task"
@@ -42,6 +41,18 @@ const (
 	StopOutput   StopReason = "output_error"
 )
 
+// Exported causes callers can pass to context.CancelCauseFunc.
+var (
+	ErrUserCancel = errors.New("user cancelled task")
+	ErrShutdown   = errors.New("application shutdown")
+	ErrSIGINT     = errors.New("received SIGINT")
+	ErrSIGTERM    = errors.New("received SIGTERM")
+)
+
+// ErrUnsupportedPlatform indicates that process-group execution is available
+// only on Linux in this release.
+var ErrUnsupportedPlatform = errors.New("task execution is supported only on Linux")
+
 // Result contains the child outcome and any independent runner or cleanup error.
 type Result struct {
 	TaskName         string
@@ -64,41 +75,31 @@ type Runner interface {
 }
 
 // ExecRunner runs a task using the operating system process implementation.
-// Cancellation and timeout enforcement after process start are handled by the
-// process supervisor milestone; this implementation honors cancellation before
-// it starts a child.
 type ExecRunner struct{}
 
 // New constructs a runner.
 func New() *ExecRunner { return &ExecRunner{} }
 
-// Run starts the task and waits for the direct child exactly once. It preserves
-// stdout and stderr as separate streams and does not invoke a shell implicitly.
+// Run executes the task in an owned process group and waits for the direct child
+// exactly once. Cancellation force-kills the group and may interrupt child I/O.
 func (r *ExecRunner) Run(ctx context.Context, spec task.Spec, stdout, stderr io.Writer) Result {
-	requestedAt := time.Now()
-	result := Result{
-		TaskName:    spec.Name,
-		ExitCode:    -1,
-		RequestedAt: requestedAt,
-	}
+	result := Result{TaskName: spec.Name, ExitCode: -1, RequestedAt: time.Now()}
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if err := ctx.Err(); err != nil {
+	runCtx := ctx
+	cancelTimeout := func() {}
+	if spec.Timeout > 0 {
+		runCtx, cancelTimeout = context.WithTimeout(ctx, spec.Timeout)
+	}
+	defer cancelTimeout()
+	if err := runCtx.Err(); err != nil {
+		result = classifyStop(result, context.Cause(runCtx), err)
 		result.FinishedAt = time.Now()
-		result.Err = err
-		if errors.Is(err, context.DeadlineExceeded) {
-			result.Status = TimedOut
-			result.StopReason = StopTimeout
-		} else {
-			result.Status = Cancelled
-			result.StopReason = StopUser
-		}
 		return result
 	}
 
-	// Own copies so a caller cannot mutate command arguments or environment while
-	// the child is being prepared.
+	// Own copies so caller mutation cannot affect command construction.
 	argv := append([]string(nil), spec.Argv...)
 	envOverrides := make(map[string]string, len(spec.Env))
 	for key, value := range spec.Env {
@@ -115,12 +116,12 @@ func (r *ExecRunner) Run(ctx context.Context, spec task.Spec, stdout, stderr io.
 
 	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Dir = spec.Dir
+	cmd.Env = mergeEnvironment(cmd.Environ(), envOverrides)
 	cmd.Stdin = nil
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
-	// Environ accounts for cmd.Dir (including PWD where supported). Apply task
-	// overrides after obtaining the inherited environment.
-	cmd.Env = mergeEnvironment(cmd.Environ(), envOverrides)
+	cmd.SysProcAttr = processAttributes()
+	cmd.WaitDelay = 2 * time.Second
 
 	writerErrors := make(chan error, 1)
 	tracker := &writeTracker{notify: writerErrors}
@@ -135,42 +136,64 @@ func (r *ExecRunner) Run(ctx context.Context, spec task.Spec, stdout, stderr io.
 		}
 	}
 
-	if err := cmd.Start(); err != nil {
+	outcome := supervise(runCtx, cmd, writerErrors)
+	result.ProcessStarted = outcome.started
+	result.StartedAt = outcome.startedAt
+	if outcome.startFailed {
 		result.Status = StartFailed
-		result.Err = fmt.Errorf("start task %q: %w", spec.Name, err)
+		result.Err = outcome.err
 		result.FinishedAt = time.Now()
 		return result
 	}
-	result.ProcessStarted = true
-	result.StartedAt = time.Now()
-
-	// Wait has a single owner. If a capture writer fails, stop the still-running
-	// direct child and then collect the one Wait result.
-	waitResult := make(chan error, 1)
-	go func() { waitResult <- cmd.Wait() }()
-	var waitErr error
-	select {
-	case waitErr = <-waitResult:
-	case outputErr := <-writerErrors:
-		result.StopReason = StopOutput
-		result.OutputIncomplete = true
-		result.Err = fmt.Errorf("write task output: %w", outputErr)
-		if cmd.Process != nil {
-			if err := cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
-				result.CleanupErr = fmt.Errorf("stop task after output failure: %w", err)
-			}
-		}
-		waitErr = <-waitResult
-	}
-
+	result.StopReason = outcome.stopReason
+	result.Err = outcome.err
+	result.CleanupErr = outcome.cleanupErr
+	result.OutputIncomplete = outcome.outputIncomplete
 	if err := tracker.error(); err != nil {
 		result.OutputIncomplete = true
+		if result.StopReason == StopNone {
+			result.StopReason = StopOutput
+		}
 		if result.Err == nil {
 			result.Err = fmt.Errorf("write task output: %w", err)
 		}
 	}
-	classifyWait(&result, cmd.ProcessState, waitErr)
+	classifyWait(&result, outcome.processState, outcome.waitErr)
 	result.FinishedAt = time.Now()
+	return result
+}
+
+type processOutcome struct {
+	started          bool
+	startFailed      bool
+	startedAt        time.Time
+	processState     *os.ProcessState
+	waitErr          error
+	stopReason       StopReason
+	err              error
+	cleanupErr       error
+	outputIncomplete bool
+}
+
+func classifyStop(result Result, cause, ctxErr error) Result {
+	result.Err = ctxErr
+	switch {
+	case errors.Is(ctxErr, context.DeadlineExceeded):
+		result.Status = TimedOut
+		result.StopReason = StopTimeout
+	case errors.Is(cause, ErrShutdown):
+		result.Status = Cancelled
+		result.StopReason = StopShutdown
+	case errors.Is(cause, ErrSIGINT):
+		result.Status = Cancelled
+		result.StopReason = StopSIGINT
+	case errors.Is(cause, ErrSIGTERM):
+		result.Status = Cancelled
+		result.StopReason = StopSIGTERM
+	default:
+		result.Status = Cancelled
+		result.StopReason = StopUser
+	}
 	return result
 }
 
@@ -205,33 +228,40 @@ func mergeEnvironment(inherited []string, overrides map[string]string) []string 
 }
 
 func classifyWait(result *Result, processState *os.ProcessState, waitErr error) {
-	// Record process state before applying runner-error precedence so output or
-	// cleanup failures do not erase what is known about the child.
 	if processState != nil {
-		result.ExitCode = processState.ExitCode()
-		if status, ok := processState.Sys().(syscall.WaitStatus); ok && status.Signaled() {
-			result.TermSignal = int(status.Signal())
-			result.ExitCode = -1
-		}
+		result.ExitCode, result.TermSignal = processExitDetails(processState)
 	}
-
 	if result.Err != nil || result.CleanupErr != nil {
 		result.Status = RunnerError
 		if result.Err == nil {
 			result.Err = result.CleanupErr
 		}
-	} else if waitErr == nil {
-		result.Status = Succeeded
-	} else {
-		var exitErr *exec.ExitError
-		if errors.As(waitErr, &exitErr) {
-			result.Err = waitErr
-			result.Status = Failed
-		} else {
-			result.Status = RunnerError
-			result.Err = waitErr
-		}
+		return
 	}
+	var exitErr *exec.ExitError
+	isExitError := errors.As(waitErr, &exitErr)
+	if waitErr != nil && !isExitError {
+		result.Status = RunnerError
+		result.Err = waitErr
+		return
+	}
+	switch result.StopReason {
+	case StopTimeout:
+		result.Status = TimedOut
+		return
+	case StopUser, StopShutdown, StopSIGINT, StopSIGTERM:
+		result.Status = Cancelled
+		return
+	}
+	if waitErr == nil {
+		result.Status = Succeeded
+		if processState == nil {
+			result.ExitCode = 0
+		}
+		return
+	}
+	result.Status = Failed
+	result.Err = waitErr
 }
 
 type writeTracker struct {
