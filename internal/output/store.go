@@ -92,8 +92,8 @@ type streamState struct {
 }
 
 type streamWriter struct {
-	store  *Store
-	state  *streamState
+	store *Store
+	state *streamState
 }
 
 // DefaultLimits returns the standard v0.1 display bounds.
@@ -268,7 +268,6 @@ func (s *streamState) feedByteLocked(b byte) {
 		s.pending = s.pending[size:]
 	}
 }
-
 
 func (s *streamState) writeParserBytesLocked(data []byte) {
 	for _, b := range data {

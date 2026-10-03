@@ -17,7 +17,7 @@ import (
 
 var (
 	helperPath string
-	helperErr error
+	helperErr  error
 )
 
 func TestMain(m *testing.M) {

@@ -94,10 +94,10 @@ func TestRunMergesEnvironmentAndPreservesEmptyOverride(t *testing.T) {
 	const inheritedKey = "WORKRUN_RUNNER_INHERITED_TEST"
 	t.Setenv(inheritedKey, "inherited-value")
 	for _, tc := range []struct {
-		name  string
-		env   map[string]string
-		key   string
-		want  string
+		name string
+		env  map[string]string
+		key  string
+		want string
 	}{
 		{name: "inherited value retained", key: inheritedKey, want: "inherited-value"},
 		{name: "empty override retained", env: map[string]string{"WORKRUN_RUNNER_EMPTY_TEST": ""}, key: "WORKRUN_RUNNER_EMPTY_TEST", want: ""},
@@ -105,7 +105,7 @@ func TestRunMergesEnvironmentAndPreservesEmptyOverride(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			spec := helperSpec("env", tc.key)
-		spec.Env = tc.env
+			spec.Env = tc.env
 			var stdout bytes.Buffer
 			result := New().Run(context.Background(), spec, &stdout, io.Discard)
 			if result.Status != Succeeded {
