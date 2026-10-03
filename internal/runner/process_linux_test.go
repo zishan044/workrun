@@ -1,5 +1,3 @@
-//go:build linux
-
 package runner
 
 import (
@@ -14,7 +12,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/zishan044/workrun/internal/task"
 	"golang.org/x/sys/unix"
 )
 
