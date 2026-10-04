@@ -1,10 +1,14 @@
 package cli
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/spf13/cobra"
@@ -28,6 +32,20 @@ func (e usageError) Unwrap() error { return e.err }
 
 func usage(err error) error { return usageError{err: err} }
 
+type exitStatusError struct {
+	code int
+	err  error
+}
+
+func (e *exitStatusError) Error() string {
+	if e.err == nil {
+		return ""
+	}
+	return e.err.Error()
+}
+
+func (e *exitStatusError) Unwrap() error { return e.err }
+
 func noArgs(command string) cobra.PositionalArgs {
 	return func(_ *cobra.Command, args []string) error {
 		if len(args) != 0 {
@@ -45,6 +63,13 @@ func Execute(args []string, stdin io.Reader, stdout, stderr io.Writer, build Bui
 	err := root.Execute()
 	if err == nil {
 		return 0
+	}
+	var exitErr *exitStatusError
+	if errors.As(err, &exitErr) {
+		if exitErr.err != nil {
+			_, _ = fmt.Fprintf(stderr, "workrun: %v\n", exitErr.err)
+		}
+		return exitErr.code
 	}
 
 	var usageErr usageError
@@ -120,13 +145,20 @@ func newRoot(stdin io.Reader, stdout, stderr io.Writer, build BuildInfo) *cobra.
 		Short: "Open the interactive task runner",
 		Args:  noArgs("tui"),
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return runConfiguredTUI(configPath, func(model tui.Model) error {
-				_, err := tea.NewProgram(model,
+			return runConfiguredTUI(configPath, func(model tui.Model, manager *session.Manager, appCtx context.Context, cancelApp context.CancelCauseFunc, shutdown *tui.ShutdownState) error {
+				program := tea.NewProgram(model,
 					tea.WithInput(cmd.InOrStdin()),
 					tea.WithOutput(cmd.OutOrStdout()),
-				).Run()
-				if err != nil {
-					return fmt.Errorf("run TUI: %w", err)
+					tea.WithoutSignalHandler(),
+				)
+				signals := make(chan os.Signal, 1)
+				signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
+				reason, runErr := runTUIProgram(program, manager, cancelApp, shutdown, signals, func() { signal.Stop(signals) })
+				if runErr != nil {
+					return &exitStatusError{code: tuiExitCode(reason, runErr), err: fmt.Errorf("run TUI: %w", runErr)}
+				}
+				if code := tuiExitCode(reason, nil); code != 0 {
+					return &exitStatusError{code: code}
 				}
 				return nil
 			})
@@ -135,11 +167,84 @@ func newRoot(stdin io.Reader, stdout, stderr io.Writer, build BuildInfo) *cobra.
 	return root
 }
 
-func runConfiguredTUI(configPath string, launch func(tui.Model) error) error {
+func runConfiguredTUI(configPath string, launch func(tui.Model, *session.Manager, context.Context, context.CancelCauseFunc, *tui.ShutdownState) error) error {
 	project, err := config.Load(configPath)
 	if err != nil {
 		return err
 	}
 	manager := session.NewManager(runner.New())
-	return launch(tui.NewModel(project.Path, project.Tasks(), manager))
+	appCtx, cancelApp := context.WithCancelCause(context.Background())
+	defer cancelApp(nil)
+	shutdown := &tui.ShutdownState{}
+	model := tui.NewModel(project.Path, project.Tasks(), manager, appCtx, shutdown)
+	return launch(model, manager, appCtx, cancelApp, shutdown)
+}
+
+type teaProgram interface {
+	Run() (tea.Model, error)
+	Send(tea.Msg)
+}
+
+func runTUIProgram(program teaProgram, manager *session.Manager, cancelApp context.CancelCauseFunc, shutdown *tui.ShutdownState, signals <-chan os.Signal, stopSignals func()) (runner.StopReason, error) {
+	if stopSignals == nil {
+		stopSignals = func() {}
+	}
+	defer stopSignals()
+	stopWatcher := make(chan struct{})
+	watcherDone := make(chan struct{})
+	handleSignal := func(sig os.Signal) {
+		reason, cause := runner.StopNone, error(nil)
+		switch sig {
+		case syscall.SIGINT:
+			reason, cause = runner.StopSIGINT, runner.ErrSIGINT
+		case syscall.SIGTERM:
+			reason, cause = runner.StopSIGTERM, runner.ErrSIGTERM
+		default:
+			return
+		}
+		effective, first := shutdown.Request(reason)
+		if first {
+			cancelApp(cause)
+			go program.Send(tui.ShutdownRequestedMsg{Reason: effective})
+		}
+	}
+	go func() {
+		defer close(watcherDone)
+		for {
+			select {
+			case sig := <-signals:
+				handleSignal(sig)
+			case <-stopWatcher:
+				for {
+					select {
+					case sig := <-signals:
+						handleSignal(sig)
+					default:
+						return
+					}
+				}
+			}
+		}
+	}()
+	_, runErr := program.Run()
+	cleanupErr := manager.CloseAndWait()
+	stopSignals()
+	close(stopWatcher)
+	<-watcherDone
+	cancelApp(nil)
+	return shutdown.Reason(), errors.Join(runErr, cleanupErr)
+}
+
+func tuiExitCode(reason runner.StopReason, runErr error) int {
+	if runErr != nil {
+		return 1
+	}
+	switch reason {
+	case runner.StopSIGINT:
+		return 130
+	case runner.StopSIGTERM:
+		return 143
+	default:
+		return 0
+	}
 }

@@ -57,6 +57,8 @@ type Model struct {
 	project       string
 	tasks         []task.Spec
 	manager       *session.Manager
+	appCtx        context.Context
+	shutdown      *ShutdownState
 	selected      int
 	phase         Phase
 	focus         Focus
@@ -78,7 +80,13 @@ type Model struct {
 }
 
 // NewModel constructs a sorted, idle TUI model from validated task specs.
-func NewModel(project string, tasks []task.Spec, manager *session.Manager) Model {
+func NewModel(project string, tasks []task.Spec, manager *session.Manager, appCtx context.Context, shutdown *ShutdownState) Model {
+	if appCtx == nil {
+		appCtx = context.Background()
+	}
+	if shutdown == nil {
+		shutdown = &ShutdownState{}
+	}
 	ordered := append([]task.Spec(nil), tasks...)
 	for i := range ordered {
 		ordered[i].Argv = append([]string(nil), ordered[i].Argv...)
@@ -95,6 +103,8 @@ func NewModel(project string, tasks []task.Spec, manager *session.Manager) Model
 		project:      project,
 		tasks:        ordered,
 		manager:      manager,
+		appCtx:       appCtx,
+		shutdown:     shutdown,
 		lastResults:  make(map[string]runner.Result),
 		output:       output.NewStore(output.DefaultLimits()),
 		outputView:   viewport.New(),
@@ -111,6 +121,9 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 		m.resizeOutput()
+	case ShutdownRequestedMsg:
+		reason, _ := m.shutdown.Request(msg.Reason)
+		return m.requestShutdown(reason)
 	case runAcceptedMsg:
 		if msg.RequestID != m.requestID || m.phase == Idle {
 			if msg.Run != nil {
@@ -220,16 +233,21 @@ func (m *Model) recordStartFailure(err error) {
 
 func (m Model) updateKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	key := msg.String()
+	if key == "ctrl+c" {
+		reason, _ := m.shutdown.Request(runner.StopSIGINT)
+		if m.phase == Idle {
+			return m, tea.Quit
+		}
+		return m.requestShutdown(reason)
+	}
 	if m.confirmQuit {
 		switch key {
 		case "esc", "n", "q":
 			m.confirmQuit = false
 		case "enter", "y":
 			m.confirmQuit = false
-			m.exitAfterRun = true
-			m.phase = Stopping
-			m.cancelRun(runner.ErrShutdown)
-			return m, nil
+			reason, _ := m.shutdown.Request(runner.StopShutdown)
+			return m.requestShutdown(reason)
 		}
 		return m, nil
 	}
@@ -244,17 +262,9 @@ func (m Model) updateKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.showHelp = true
 		return m, nil
 	}
-	if key == "ctrl+c" {
-		if m.phase == Idle {
-			return m, tea.Quit
-		}
-		m.exitAfterRun = true
-		m.phase = Stopping
-		m.cancelRun(runner.ErrShutdown)
-		return m, nil
-	}
 	if key == "q" {
 		if m.phase == Idle {
+			m.shutdown.Request(runner.StopShutdown)
 			return m, tea.Quit
 		}
 		m.confirmQuit = true
@@ -281,7 +291,7 @@ func (m Model) updateKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.output = output.NewStore(output.DefaultLimits())
 			m.outputRevision = 0
 			m.outputTruncated = false
-			ctx, cancel := context.WithCancelCause(context.Background())
+			ctx, cancel := context.WithCancelCause(m.appCtx)
 			m.requestCancel = cancel
 			m.followOutput = true
 			id := m.requestID
@@ -325,6 +335,28 @@ func (m *Model) cancelRun(cause error) {
 	}
 	if m.run != nil {
 		m.run.Cancel(cause)
+	}
+}
+
+func (m Model) requestShutdown(reason runner.StopReason) (tea.Model, tea.Cmd) {
+	if m.phase == Idle {
+		return m, tea.Quit
+	}
+	m.exitAfterRun = true
+	m.confirmQuit = false
+	m.phase = Stopping
+	m.cancelRun(stopCause(reason))
+	return m, nil
+}
+
+func stopCause(reason runner.StopReason) error {
+	switch reason {
+	case runner.StopSIGINT:
+		return runner.ErrSIGINT
+	case runner.StopSIGTERM:
+		return runner.ErrSIGTERM
+	default:
+		return runner.ErrShutdown
 	}
 }
 

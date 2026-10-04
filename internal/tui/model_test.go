@@ -33,7 +33,12 @@ func (r *modelRunner) Run(ctx context.Context, spec task.Spec, stdout, _ io.Writ
 		close(r.cancelled)
 		result.Status = runner.Cancelled
 		result.StopReason = runner.StopUser
-		if errors.Is(context.Cause(ctx), runner.ErrShutdown) {
+		switch {
+		case errors.Is(context.Cause(ctx), runner.ErrSIGINT):
+			result.StopReason = runner.StopSIGINT
+		case errors.Is(context.Cause(ctx), runner.ErrSIGTERM):
+			result.StopReason = runner.StopSIGTERM
+		case errors.Is(context.Cause(ctx), runner.ErrShutdown):
 			result.StopReason = runner.StopShutdown
 		}
 	case <-r.release:
@@ -50,7 +55,7 @@ func newTestModel() (Model, *modelRunner) {
 		{Name: "zeta", Description: "last", Dir: "/tmp/z"},
 		{Name: "alpha", Description: "first", Argv: []string{"true"}, Dir: "/tmp/a"},
 		{Name: "middle", Description: "middle", Dir: "/tmp/m"},
-	}, manager), r
+	}, manager, context.Background(), &ShutdownState{}), r
 }
 
 func testModel() Model {
@@ -191,6 +196,21 @@ func TestCancelActiveRunLeavesTUIOpen(t *testing.T) {
 	}
 }
 
+func TestTaskCancellationDoesNotCancelApplicationContext(t *testing.T) {
+	appCtx, cancelApp := context.WithCancelCause(context.Background())
+	defer cancelApp(nil)
+	fake := newModelRunner()
+	manager := session.NewManager(fake)
+	m := NewModel("example", []task.Spec{{Name: "alpha"}}, manager, appCtx, &ShutdownState{})
+	m, run := startModelRun(t, m)
+	waitFor(t, fake.started)
+	m, _ = updateKey(m, "c")
+	waitFor(t, run.Done())
+	if appCtx.Err() != nil {
+		t.Fatalf("task cancellation ended application context: %v", appCtx.Err())
+	}
+}
+
 func TestQuitConfirmationWaitsForActiveCleanup(t *testing.T) {
 	m, fake := newTestModel()
 	m, run := startModelRun(t, m)
@@ -209,6 +229,56 @@ func TestQuitConfirmationWaitsForActiveCleanup(t *testing.T) {
 	if updated.(Model).lastResults["alpha"].Status != runner.Cancelled {
 		t.Fatal("quit result did not preserve runner cancellation outcome")
 	}
+	if got := updated.(Model).shutdown.Reason(); got != runner.StopShutdown {
+		t.Fatalf("quit reason = %q, want ordinary shutdown", got)
+	}
+}
+
+func TestExternalShutdownMessageQuitsIdleModel(t *testing.T) {
+	m, _ := newTestModel()
+	updated, cmd := m.Update(ShutdownRequestedMsg{Reason: runner.StopSIGTERM})
+	if cmd == nil || updated.(Model).shutdown.Reason() != runner.StopSIGTERM {
+		t.Fatalf("idle shutdown did not quit with SIGTERM reason: cmd=%v", cmd != nil)
+	}
+}
+
+func TestExternalShutdownWaitsForActiveRunCleanup(t *testing.T) {
+	m, fake := newTestModel()
+	m, run := startModelRun(t, m)
+	waitFor(t, fake.started)
+	updated, cmd := m.Update(ShutdownRequestedMsg{Reason: runner.StopSIGTERM})
+	m = updated.(Model)
+	if cmd != nil || m.phase != Stopping || !m.exitAfterRun {
+		t.Fatalf("external shutdown state: phase=%d exit=%v cmd=%v", m.phase, m.exitAfterRun, cmd != nil)
+	}
+	waitFor(t, fake.cancelled)
+	waitFor(t, run.Done())
+	updated, cmd = m.Update(runFinishedMsg{RequestID: m.requestID, Result: run.Result()})
+	if cmd == nil || updated.(Model).shutdown.Reason() != runner.StopSIGTERM {
+		t.Fatal("external shutdown did not quit after cleanup")
+	}
+}
+
+func TestShutdownStateKeepsFirstReason(t *testing.T) {
+	state := &ShutdownState{}
+	if reason, accepted := state.Request(runner.StopShutdown); !accepted || reason != runner.StopShutdown {
+		t.Fatalf("first request = (%q, %v)", reason, accepted)
+	}
+	if reason, accepted := state.Request(runner.StopSIGTERM); accepted || reason != runner.StopShutdown {
+		t.Fatalf("later request = (%q, %v), want first reason", reason, accepted)
+	}
+}
+
+func TestCtrlCRecordsSIGINT(t *testing.T) {
+	m, fake := newTestModel()
+	m, run := startModelRun(t, m)
+	waitFor(t, fake.started)
+	m, _ = updateKey(m, "ctrl+c")
+	if m.phase != Stopping || m.shutdown.Reason() != runner.StopSIGINT {
+		t.Fatalf("Ctrl+C state: phase=%d reason=%q", m.phase, m.shutdown.Reason())
+	}
+	waitFor(t, fake.cancelled)
+	waitFor(t, run.Done())
 }
 
 func TestStaleRunMessagesAreIgnored(t *testing.T) {
@@ -229,7 +299,7 @@ func TestStaleRunMessagesAreIgnored(t *testing.T) {
 func TestStartFailureReturnsToIdleAndRecordsError(t *testing.T) {
 	manager := session.NewManager(nil)
 	_ = manager.CloseAndWait()
-	m := NewModel("example", []task.Spec{{Name: "alpha"}}, manager)
+	m := NewModel("example", []task.Spec{{Name: "alpha"}}, manager, context.Background(), &ShutdownState{})
 	m, start := updateKey(m, "enter")
 	updated, cmd := m.Update(start().(runAcceptedMsg))
 	m = updated.(Model)

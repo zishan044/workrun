@@ -2,12 +2,14 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/zishan044/workrun/internal/session"
 	"github.com/zishan044/workrun/internal/tui"
 )
 
@@ -133,7 +135,7 @@ tasks:
 	}
 	wantErr := errors.New("terminal unavailable")
 	called := false
-	err := runConfiguredTUI(configPath, func(model tui.Model) error {
+	err := runConfiguredTUI(configPath, func(model tui.Model, _ *session.Manager, _ context.Context, _ context.CancelCauseFunc, _ *tui.ShutdownState) error {
 		called = true
 		if !strings.Contains(model.View().Content, "test") {
 			t.Fatalf("loaded model does not show configured task: %q", model.View().Content)
