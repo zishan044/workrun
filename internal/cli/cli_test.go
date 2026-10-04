@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	tea "charm.land/bubbletea/v2"
 	"github.com/zishan044/workrun/internal/session"
 	"github.com/zishan044/workrun/internal/tui"
 )
@@ -137,6 +138,8 @@ tasks:
 	called := false
 	err := runConfiguredTUI(configPath, func(model tui.Model, _ *session.Manager, _ context.Context, _ context.CancelCauseFunc, _ *tui.ShutdownState) error {
 		called = true
+		updated, _ := model.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+		model = updated.(tui.Model)
 		if !strings.Contains(model.View().Content, "test") {
 			t.Fatalf("loaded model does not show configured task: %q", model.View().Content)
 		}
@@ -147,10 +150,48 @@ tasks:
 	}
 }
 
-func TestTUICommandReportsConfigurationLoadFailure(t *testing.T) {
+func TestRequireInteractiveTUIRejectsRedirectedStreams(t *testing.T) {
+	in, inWriter, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer in.Close()
+	defer inWriter.Close()
+	outReader, out, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outReader.Close()
+	defer out.Close()
+
+	err = requireInteractiveTUI(in, out, "xterm-256color")
+	if err == nil || !strings.Contains(err.Error(), "terminal stdin and stdout") || !strings.Contains(err.Error(), "workrun run TASK") {
+		t.Fatalf("redirected streams error = %v, want actionable terminal guidance", err)
+	}
+}
+
+func TestRequireInteractiveTUIRejectsDumbTerminal(t *testing.T) {
+	err := requireInteractiveTUI(strings.NewReader(""), &bytes.Buffer{}, "dumb")
+	if err == nil || !strings.Contains(err.Error(), "TERM=dumb") || !strings.Contains(err.Error(), "workrun run TASK") {
+		t.Fatalf("TERM=dumb error = %v, want actionable terminal guidance", err)
+	}
+}
+
+func TestTUICommandRejectsRedirectedStreamsWithoutOpeningTTY(t *testing.T) {
+	t.Setenv("TERM", "xterm-256color")
 	var stdout, stderr bytes.Buffer
 	code := Execute([]string{"--config", filepath.Join(t.TempDir(), "missing.yaml"), "tui"}, strings.NewReader(""), &stdout, &stderr, BuildInfo{})
-	if code != 1 || !strings.Contains(stderr.String(), "read configuration") {
-		t.Fatalf("TUI configuration failure: code=%d stderr=%q", code, stderr.String())
+	if code != 1 || !strings.Contains(stderr.String(), "terminal stdin and stdout") || !strings.Contains(stderr.String(), "workrun run TASK") {
+		t.Fatalf("redirected TUI command: code=%d stderr=%q", code, stderr.String())
+	}
+}
+
+func TestRunConfiguredTUIReportsConfigurationLoadFailure(t *testing.T) {
+	err := runConfiguredTUI(filepath.Join(t.TempDir(), "missing.yaml"), func(tui.Model, *session.Manager, context.Context, context.CancelCauseFunc, *tui.ShutdownState) error {
+		t.Fatal("launch callback ran after config load failure")
+		return nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "read configuration") {
+		t.Fatalf("runConfiguredTUI config error = %v", err)
 	}
 }

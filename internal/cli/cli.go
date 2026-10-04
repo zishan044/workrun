@@ -16,6 +16,7 @@ import (
 	"github.com/zishan044/workrun/internal/runner"
 	"github.com/zishan044/workrun/internal/session"
 	"github.com/zishan044/workrun/internal/tui"
+	"golang.org/x/term"
 )
 
 // BuildInfo contains values injected by the release build.
@@ -145,6 +146,9 @@ func newRoot(stdin io.Reader, stdout, stderr io.Writer, build BuildInfo) *cobra.
 		Short: "Open the interactive task runner",
 		Args:  noArgs("tui"),
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			if err := requireInteractiveTUI(cmd.InOrStdin(), cmd.OutOrStdout(), os.Getenv("TERM")); err != nil {
+				return err
+			}
 			return runConfiguredTUI(configPath, func(model tui.Model, manager *session.Manager, appCtx context.Context, cancelApp context.CancelCauseFunc, shutdown *tui.ShutdownState) error {
 				program := tea.NewProgram(model,
 					tea.WithInput(cmd.InOrStdin()),
@@ -165,6 +169,19 @@ func newRoot(stdin io.Reader, stdout, stderr io.Writer, build BuildInfo) *cobra.
 		},
 	})
 	return root
+}
+
+func requireInteractiveTUI(input io.Reader, output io.Writer, termName string) error {
+	const guidance = "use 'workrun run TASK' for noninteractive execution"
+	if termName == "dumb" {
+		return fmt.Errorf("tui requires a capable terminal (TERM=dumb); %s", guidance)
+	}
+	inFile, inOK := input.(*os.File)
+	outFile, outOK := output.(*os.File)
+	if !inOK || !outOK || !term.IsTerminal(int(inFile.Fd())) || !term.IsTerminal(int(outFile.Fd())) {
+		return fmt.Errorf("tui requires terminal stdin and stdout; %s", guidance)
+	}
+	return nil
 }
 
 func runConfiguredTUI(configPath string, launch func(tui.Model, *session.Manager, context.Context, context.CancelCauseFunc, *tui.ShutdownState) error) error {

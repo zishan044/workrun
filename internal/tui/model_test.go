@@ -9,6 +9,7 @@ import (
 	"time"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/zishan044/workrun/internal/output"
 	"github.com/zishan044/workrun/internal/runner"
 	"github.com/zishan044/workrun/internal/session"
 	"github.com/zishan044/workrun/internal/task"
@@ -75,6 +76,8 @@ func press(key string) tea.KeyPressMsg {
 		return tea.KeyPressMsg(tea.Key{Code: tea.KeyUp})
 	case "down":
 		return tea.KeyPressMsg(tea.Key{Code: tea.KeyDown})
+	case "end":
+		return tea.KeyPressMsg(tea.Key{Code: tea.KeyEnd})
 	case "ctrl+c":
 		return tea.KeyPressMsg(tea.Key{Code: 'c', Mod: tea.ModCtrl})
 	default:
@@ -134,6 +137,8 @@ func TestTasksAreSortedAndFocusRoutesNavigation(t *testing.T) {
 
 func TestEnterStartsRealSessionAndDisplaysFinalOutput(t *testing.T) {
 	m, fake := newTestModel()
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	m = updated.(Model)
 	m, run := startModelRun(t, m)
 	waitFor(t, fake.started)
 	if run.TaskName != "alpha" {
@@ -147,8 +152,8 @@ func TestEnterStartsRealSessionAndDisplaysFinalOutput(t *testing.T) {
 	waitFor(t, run.Done())
 	updated, cmd := m.Update(runFinishedMsg{RequestID: m.requestID, Result: run.Result()})
 	m = updated.(Model)
-	if cmd != nil || m.phase != Idle || m.lastResults["alpha"].Status != runner.Succeeded {
-		t.Fatalf("completion state: phase=%d status=%q cmd=%v", m.phase, m.lastResults["alpha"].Status, cmd != nil)
+	if cmd != nil || m.phase != Idle || m.lastResults["alpha"] != runner.Succeeded {
+		t.Fatalf("completion state: phase=%d status=%q cmd=%v", m.phase, m.lastResults["alpha"], cmd != nil)
 	}
 	var visible strings.Builder
 	snapshot, _ = m.output.SnapshotIfChanged(0)
@@ -158,6 +163,128 @@ func TestEnterStartsRealSessionAndDisplaysFinalOutput(t *testing.T) {
 	if got := visible.String(); !strings.Contains(got, "live output") || !strings.Contains(got, "final partial output") {
 		t.Fatalf("final output missing from retained store: %q", got)
 	}
+	if got := m.outputView.View(); !strings.Contains(got, "final partial output") {
+		t.Fatalf("final partial output missing from viewport: %q", got)
+	}
+}
+
+func TestStartingAnotherRunClearsPriorViewportContent(t *testing.T) {
+	m := testModel()
+	m.outputTask = "previous"
+	_, _ = io.WriteString(m.output.StdoutWriter(), "old output\n")
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	m = updated.(Model)
+	if !strings.Contains(m.outputView.View(), "old output") {
+		t.Fatal("test setup did not populate prior output")
+	}
+	m, cmd := updateKey(m, "enter")
+	if cmd == nil || m.phase != Launching {
+		t.Fatalf("Enter did not launch the next task: phase=%d", m.phase)
+	}
+	if strings.Contains(m.outputView.View(), "old output") {
+		t.Fatalf("prior run output remained visible while launching: %q", m.outputView.View())
+	}
+}
+
+func TestPausedOutputAnchorsByRecordAndClampsOnEviction(t *testing.T) {
+	m := testModel()
+	m.output = output.NewStore(output.Limits{MaxBytes: 128, MaxRecords: 4, MaxRecordBytes: 32})
+	_, _ = io.WriteString(m.output.StdoutWriter(), "one\ntwo\nthree\nfour\n")
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 51, Height: 13})
+	m = updated.(Model)
+	m.followOutput = false
+	m.outputView.SetYOffset(1)
+
+	_, _ = io.WriteString(m.output.StdoutWriter(), "five\n")
+	m.refreshOutputIfChanged()
+	if got := m.outputView.YOffset(); got != 0 {
+		t.Fatalf("anchor for retained record moved to offset %d, want 0", got)
+	}
+	if got := m.outputView.View(); !strings.Contains(got, "two") {
+		t.Fatalf("viewport lost retained anchor record: %q", got)
+	}
+
+	_, _ = io.WriteString(m.output.StdoutWriter(), "six\n")
+	m.refreshOutputIfChanged()
+	if got := m.outputView.YOffset(); got != 0 {
+		t.Fatalf("evicted anchor offset = %d, want oldest retained row", got)
+	}
+	if !m.outputEvicted || !strings.Contains(m.outputView.View(), "three") {
+		t.Fatalf("eviction did not clamp to oldest retained output: evicted=%v view=%q", m.outputEvicted, m.outputView.View())
+	}
+}
+
+func TestResizeReclipsRetainedOutputWithoutNewBytes(t *testing.T) {
+	m := testModel()
+	m.outputTask = "alpha"
+	_, _ = io.WriteString(m.output.StdoutWriter(), strings.Repeat("x", 80)+"\n")
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	m = updated.(Model)
+	wide := m.outputView.View()
+	if !strings.Contains(wide, "…") {
+		t.Fatalf("wide viewport did not mark clipped output: %q", wide)
+	}
+
+	updated, _ = m.Update(tea.WindowSizeMsg{Width: 52, Height: 16})
+	m = updated.(Model)
+	narrow := m.outputView.View()
+	if !strings.Contains(narrow, "…") || len(narrow) >= len(wide) {
+		t.Fatalf("resize did not reclip retained record: wide=%q narrow=%q", wide, narrow)
+	}
+	if m.outputRenderedWidth != m.outputContentWidth() {
+		t.Fatalf("cached output width = %d, want %d", m.outputRenderedWidth, m.outputContentWidth())
+	}
+}
+
+func TestEndResumesOutputFollowing(t *testing.T) {
+	m := testModel()
+	_, _ = io.WriteString(m.output.StdoutWriter(), "one\ntwo\nthree\nfour\n")
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 51, Height: 13})
+	m = updated.(Model)
+	m.focus = Output
+	m.followOutput = false
+	m.outputView.SetYOffset(0)
+	m, _ = updateKey(m, "end")
+	if !m.followOutput || !m.outputView.AtBottom() {
+		t.Fatal("End did not resume following output")
+	}
+}
+
+func TestTUIOutputFloodStaysBoundedAndCancelRemainsAvailable(t *testing.T) {
+	m := testModel()
+	m.output = output.NewStore(output.Limits{MaxBytes: 64, MaxRecords: 4, MaxRecordBytes: 16})
+	_, _ = io.WriteString(m.output.StdoutWriter(), strings.Repeat("flood\n", 1000))
+	snapshot, changed := m.output.SnapshotIfChanged(0)
+	if !changed || snapshot.RetainedBytes > 64 || len(snapshot.Records) > 4 {
+		t.Fatalf("flood exceeded output limits: changed=%v bytes=%d records=%d", changed, snapshot.RetainedBytes, len(snapshot.Records))
+	}
+	m.phase = Active
+	m, _ = updateKey(m, "c")
+	if m.phase != Stopping {
+		t.Fatalf("cancel key was not handled after output flood: phase=%d", m.phase)
+	}
+}
+
+func TestCompactLayoutKeepsQuitAndCancelKeysAvailable(t *testing.T) {
+	m, fake := newTestModel()
+	m, run := startModelRun(t, m)
+	waitFor(t, fake.started)
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 23, Height: 12})
+	m = updated.(Model)
+	if !strings.Contains(m.View().Content, "Resize") {
+		t.Fatalf("compact view missing resize guidance: %q", m.View().Content)
+	}
+	m, _ = updateKey(m, "q")
+	if !m.confirmQuit {
+		t.Fatal("q did not open quit confirmation in compact layout")
+	}
+	m, _ = updateKey(m, "n")
+	m, _ = updateKey(m, "c")
+	if m.phase != Stopping {
+		t.Fatal("c did not cancel in compact layout")
+	}
+	waitFor(t, fake.cancelled)
+	waitFor(t, run.Done())
 }
 
 func TestCancelDuringLaunchCancelsAcceptedRun(t *testing.T) {
@@ -174,8 +301,8 @@ func TestCancelDuringLaunchCancelsAcceptedRun(t *testing.T) {
 	waitFor(t, m.run.Done())
 	updated, cmd := m.Update(runFinishedMsg{RequestID: m.requestID, Result: m.run.Result()})
 	m = updated.(Model)
-	if cmd != nil || m.phase != Idle || m.lastResults["alpha"].Status != runner.Cancelled {
-		t.Fatalf("launch cancellation did not finish as cancelled: phase=%d result=%q", m.phase, m.lastResults["alpha"].Status)
+	if cmd != nil || m.phase != Idle || m.lastResults["alpha"] != runner.Cancelled {
+		t.Fatalf("launch cancellation did not finish as cancelled: phase=%d result=%q", m.phase, m.lastResults["alpha"])
 	}
 }
 
@@ -191,8 +318,8 @@ func TestCancelActiveRunLeavesTUIOpen(t *testing.T) {
 	waitFor(t, run.Done())
 	updated, cmd := m.Update(runFinishedMsg{RequestID: m.requestID, Result: run.Result()})
 	m = updated.(Model)
-	if cmd != nil || m.phase != Idle || m.lastResults["alpha"].Status != runner.Cancelled {
-		t.Fatalf("cancel completion state: phase=%d result=%q cmd=%v", m.phase, m.lastResults["alpha"].Status, cmd != nil)
+	if cmd != nil || m.phase != Idle || m.lastResults["alpha"] != runner.Cancelled {
+		t.Fatalf("cancel completion state: phase=%d result=%q cmd=%v", m.phase, m.lastResults["alpha"], cmd != nil)
 	}
 }
 
@@ -226,7 +353,7 @@ func TestQuitConfirmationWaitsForActiveCleanup(t *testing.T) {
 	if cmd == nil {
 		t.Fatal("quit did not return tea.Quit after cleanup")
 	}
-	if updated.(Model).lastResults["alpha"].Status != runner.Cancelled {
+	if updated.(Model).lastResults["alpha"] != runner.Cancelled {
 		t.Fatal("quit result did not preserve runner cancellation outcome")
 	}
 	if got := updated.(Model).shutdown.Reason(); got != runner.StopShutdown {
@@ -303,7 +430,7 @@ func TestStartFailureReturnsToIdleAndRecordsError(t *testing.T) {
 	m, start := updateKey(m, "enter")
 	updated, cmd := m.Update(start().(runAcceptedMsg))
 	m = updated.(Model)
-	if cmd != nil || m.phase != Idle || m.lastResults["alpha"].Status != runner.StartFailed {
-		t.Fatalf("start failure state: phase=%d result=%q cmd=%v", m.phase, m.lastResults["alpha"].Status, cmd != nil)
+	if cmd != nil || m.phase != Idle || m.lastResults["alpha"] != runner.StartFailed {
+		t.Fatalf("start failure state: phase=%d result=%q cmd=%v", m.phase, m.lastResults["alpha"], cmd != nil)
 	}
 }

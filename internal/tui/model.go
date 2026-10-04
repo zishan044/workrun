@@ -7,10 +7,12 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 
 	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/zishan044/workrun/internal/output"
 	"github.com/zishan044/workrun/internal/runner"
 	"github.com/zishan044/workrun/internal/session"
@@ -52,31 +54,51 @@ type refreshMsg struct {
 	At        time.Time
 }
 
+const (
+	wideMinWidth     = 76
+	mediumMinWidth   = 52
+	compactMinWidth  = 24
+	wideMinHeight    = 16
+	compactMinHeight = 13
+)
+
+type layoutMode int
+
+const (
+	compactLayout layoutMode = iota
+	stackedLayout
+	mediumLayout
+	wideLayout
+)
+
 // Model is the Bubble Tea model for the task screen.
 type Model struct {
-	project       string
-	tasks         []task.Spec
-	manager       *session.Manager
-	appCtx        context.Context
-	shutdown      *ShutdownState
-	selected      int
-	phase         Phase
-	focus         Focus
-	requestID     uint64
-	requestedAt   time.Time
-	requestCancel context.CancelCauseFunc
-	run           *session.Run
-	outputRevision  uint64
-	outputTruncated bool
-	lastResults   map[string]runner.Result
-	outputTask    string
-	output        *output.Store
-	outputView    viewport.Model
-	followOutput  bool
-	showHelp      bool
-	confirmQuit   bool
-	exitAfterRun  bool
-	width, height int
+	project             string
+	tasks               []task.Spec
+	manager             *session.Manager
+	appCtx              context.Context
+	shutdown            *ShutdownState
+	selected            int
+	phase               Phase
+	focus               Focus
+	requestID           uint64
+	requestedAt         time.Time
+	requestCancel       context.CancelCauseFunc
+	run                 *session.Run
+	outputRevision      uint64
+	outputRecords       []output.Record
+	outputRendered      bool
+	outputRenderedWidth int
+	outputEvicted       bool
+	lastResults         map[string]runner.Status
+	outputTask          string
+	output              *output.Store
+	outputView          viewport.Model
+	followOutput        bool
+	showHelp            bool
+	confirmQuit         bool
+	exitAfterRun        bool
+	width, height       int
 }
 
 // NewModel constructs a sorted, idle TUI model from validated task specs.
@@ -105,7 +127,7 @@ func NewModel(project string, tasks []task.Spec, manager *session.Manager, appCt
 		manager:      manager,
 		appCtx:       appCtx,
 		shutdown:     shutdown,
-		lastResults:  make(map[string]runner.Result),
+		lastResults:  make(map[string]runner.Status),
 		output:       output.NewStore(output.DefaultLimits()),
 		outputView:   viewport.New(),
 		followOutput: true,
@@ -121,6 +143,7 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 		m.resizeOutput()
+		m.refreshOutputIfChanged()
 	case ShutdownRequestedMsg:
 		reason, _ := m.shutdown.Request(msg.Reason)
 		return m.requestShutdown(reason)
@@ -153,7 +176,7 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		if result.RequestedAt.IsZero() {
 			result.RequestedAt = m.requestedAt
 		}
-		m.lastResults[result.TaskName] = result
+		m.lastResults[result.TaskName] = result.Status
 		m.refreshOutputIfChanged()
 		m.phase = Idle
 		m.confirmQuit = false
@@ -202,25 +225,58 @@ func (m Model) refreshAfter(requestID uint64) tea.Cmd {
 }
 
 func (m *Model) refreshOutputIfChanged() {
+	anchorID, hadAnchor := m.topVisibleOutputID()
 	snapshot, changed := m.output.SnapshotIfChanged(m.outputRevision)
-	if !changed {
+	if changed {
+		m.outputRevision = snapshot.Revision
+		m.outputRecords = snapshot.Records
+		m.outputEvicted = snapshot.EvictedBytes > 0 || snapshot.EvictedRecords > 0
+	}
+	width := m.outputContentWidth()
+	if !changed && m.outputRendered && m.outputRenderedWidth == width {
 		return
 	}
-	m.outputRevision = snapshot.Revision
-	m.outputTruncated = snapshot.EvictedBytes > 0 || snapshot.EvictedRecords > 0
-	var lines []string
-	for _, record := range snapshot.Records {
-		lines = append(lines, record.Text)
+
+	var content strings.Builder
+	for i, record := range m.outputRecords {
+		if i > 0 {
+			content.WriteByte('\n')
+		}
+		content.WriteString(clipDisplayText(record.Text, width))
 	}
-	m.outputView.SetContent(strings.Join(lines, "\n"))
+	m.outputView.SetContent(content.String())
+	m.outputRendered = true
+	m.outputRenderedWidth = width
 	if m.followOutput {
 		m.outputView.GotoBottom()
+		return
 	}
+	if !hadAnchor {
+		m.outputView.SetYOffset(0)
+		return
+	}
+	for i, record := range m.outputRecords {
+		if record.ID == anchorID {
+			m.outputView.SetYOffset(i)
+			return
+		}
+	}
+	m.outputView.SetYOffset(0)
+	if len(m.outputRecords) > 0 {
+		m.outputEvicted = true
+	}
+}
+
+func (m Model) topVisibleOutputID() (uint64, bool) {
+	if m.followOutput || m.outputView.YOffset() < 0 || m.outputView.YOffset() >= len(m.outputRecords) {
+		return 0, false
+	}
+	return m.outputRecords[m.outputView.YOffset()].ID, true
 }
 
 func (m *Model) recordStartFailure(err error) {
 	result := runner.Result{TaskName: m.outputTask, Status: runner.StartFailed, ExitCode: -1, Err: err, FinishedAt: time.Now()}
-	m.lastResults[m.outputTask] = result
+	m.lastResults[m.outputTask] = result.Status
 	_, _ = fmt.Fprintln(m.output.StderrWriter(), err)
 	m.output.Finish()
 	m.refreshOutputIfChanged()
@@ -290,7 +346,10 @@ func (m Model) updateKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.outputTask = m.tasks[m.selected].Name
 			m.output = output.NewStore(output.DefaultLimits())
 			m.outputRevision = 0
-			m.outputTruncated = false
+			m.outputRecords = nil
+			m.outputRendered = false
+			m.outputEvicted = false
+			m.outputView.SetContent("")
 			ctx, cancel := context.WithCancelCause(m.appCtx)
 			m.requestCancel = cancel
 			m.followOutput = true
@@ -389,12 +448,60 @@ func (m *Model) scrollOutput(delta int) {
 }
 
 func (m *Model) resizeOutput() {
-	width := max(1, m.width-6)
-	if m.width >= 76 {
-		width = max(1, (m.width-8)/2)
-	}
+	width, height := m.outputDimensions()
 	m.outputView.SetWidth(width)
-	m.outputView.SetHeight(max(1, m.height-12))
+	m.outputView.SetHeight(height)
+	if m.followOutput {
+		m.outputView.GotoBottom()
+	}
+}
+
+func (m Model) outputDimensions() (int, int) {
+	mode := m.layout()
+	if mode == compactLayout {
+		return 1, 1
+	}
+	panelWidth := max(1, m.width)
+	panelHeight := max(1, m.height-3)
+	if mode == wideLayout || mode == mediumLayout {
+		leftWidth := m.taskPanelWidth(mode, panelWidth)
+		panelWidth = max(1, panelWidth-leftWidth-1)
+	}
+	if mode == stackedLayout {
+		_, panelHeight = m.stackedPanelHeights()
+	}
+	return max(1, panelWidth-4), max(1, panelHeight-3)
+}
+
+func (m Model) outputContentWidth() int {
+	width, _ := m.outputDimensions()
+	return width
+}
+
+func (m Model) stackedPanelHeights() (int, int) {
+	available := max(8, m.height-3)
+	taskHeight := max(4, min(8, available/2))
+	return taskHeight, max(4, available-taskHeight)
+}
+
+func (m Model) layout() layoutMode {
+	if m.width < compactMinWidth || m.height < compactMinHeight {
+		return compactLayout
+	}
+	if m.height < wideMinHeight || m.width < mediumMinWidth {
+		return stackedLayout
+	}
+	if m.width < wideMinWidth {
+		return mediumLayout
+	}
+	return wideLayout
+}
+
+func (m Model) taskPanelWidth(mode layoutMode, width int) int {
+	if mode == mediumLayout {
+		return max(16, (width-1)/4)
+	}
+	return max(22, min(30, width/3))
 }
 
 // View returns a full-screen v2 view.
@@ -405,81 +512,140 @@ func (m Model) View() tea.View {
 }
 
 func (m Model) render() string {
-	width := m.width
-	if width < 24 {
-		width = 24
+	mode := m.layout()
+	width := max(0, m.width)
+	if mode == compactLayout {
+		return m.renderCompact(width, max(0, m.height))
 	}
-	if m.height > 0 && (m.width < 76 || m.height < 16) {
-		return m.renderNarrow(width)
+	if mode == stackedLayout {
+		return m.renderStacked(width, m.height)
 	}
-	if m.height == 0 {
-		return m.renderNarrow(width)
-	}
-	leftWidth := max(22, (width-8)/3)
-	rightWidth := max(24, width-leftWidth-6)
-	height := max(3, m.height-10)
-	left := m.panel("TASKS", m.renderTasks(), leftWidth, height, m.focus == Tasks)
-	content := m.outputContent()
-	right := m.panel("OUTPUT · "+m.outputLabel(), content, rightWidth, height, m.focus == Output)
-	header := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#7dd3fc")).Render(m.project + "  ·  " + m.phaseName())
-	details := m.renderDetails()
-	footer := m.renderFooter()
-	view := strings.Join([]string{header, lipgloss.JoinHorizontal(lipgloss.Top, left, right), details, footer}, "\n")
-	if m.showHelp {
-		return view + "\n" + lipgloss.NewStyle().Bold(true).Render("Help: ↑/↓ or j/k select/scroll · Tab focus · Enter run · c stop · q quit · ? close")
-	}
-	if m.confirmQuit {
-		return view + "\n" + lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#fbbf24")).Render("Stop the active task and quit? [y/Enter] yes · [n/Esc] stay")
-	}
-	return view
+	return m.renderSideBySide(mode, width, m.height)
 }
 
-func (m Model) renderNarrow(width int) string {
-	if m.height > 0 && m.height < 8 {
-		return lipgloss.NewStyle().Width(width).Render(m.project + " · " + m.phaseName() + "\n" + m.renderFooter())
-	}
-	taskBox := m.panel("TASKS", m.renderTasks(), width, max(3, min(8, len(m.tasks)+2)), m.focus == Tasks)
-	outputBox := m.panel("OUTPUT · "+m.outputLabel(), m.outputContent(), width, max(3, min(8, m.height-12)), m.focus == Output)
-	view := strings.Join([]string{
-		lipgloss.NewStyle().Bold(true).Render(m.project + " · " + m.phaseName()),
-		taskBox,
-		m.renderDetails(),
-		outputBox,
-		m.renderFooter(),
+func (m Model) renderSideBySide(mode layoutMode, width, height int) string {
+	leftWidth := m.taskPanelWidth(mode, width)
+	rightWidth := max(1, width-leftWidth-1)
+	panelHeight := max(4, height-3)
+	taskPanel := m.panel("TASKS", m.renderTasks(leftWidth-4, panelHeight-3), leftWidth, panelHeight, m.focus == Tasks)
+	outputPanel := m.panel("OUTPUT · "+m.outputLabel(), m.outputContent(), rightWidth, panelHeight, m.focus == Output)
+	header := clipDisplayText(m.project+"  ·  "+m.phaseName(), width)
+	details := clipDisplayText(m.renderDetails(), width)
+	return strings.Join([]string{
+		lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#7dd3fc")).Render(header),
+		lipgloss.JoinHorizontal(lipgloss.Top, taskPanel, " ", outputPanel),
+		details,
+		m.footerOrPrompt(width),
 	}, "\n")
-	if m.showHelp {
-		view += "\n↑/↓ or j/k select/scroll · Tab focus · Enter run · c stop · q quit · Esc close help"
+}
+
+func (m Model) renderStacked(width, height int) string {
+	taskHeight, outputHeight := m.stackedPanelHeights()
+	taskPanel := m.panel("TASKS", m.renderTasks(width-4, taskHeight-3), width, taskHeight, m.focus == Tasks)
+	outputPanel := m.panel("OUTPUT · "+m.outputLabel(), m.outputContent(), width, outputHeight, m.focus == Output)
+	header := lipgloss.NewStyle().Bold(true).Render(clipDisplayText(m.project+" · "+m.phaseName(), width))
+	return strings.Join([]string{
+		header,
+		taskPanel,
+		clipDisplayText(m.renderDetails(), width),
+		outputPanel,
+		m.footerOrPrompt(width),
+	}, "\n")
+}
+
+func (m Model) renderCompact(width, height int) string {
+	if width < 1 {
+		width = 24
+	}
+	status := m.project + " · " + m.phaseName()
+	if m.outputEvicted {
+		status = "Older output discarded · " + m.phaseName()
+	}
+	lines := []string{
+		status,
+		"Resize to ≥24×13 · q quit · c cancel",
 	}
 	if m.confirmQuit {
-		view += "\nStop the active task and quit? [y/Enter] yes · [n/Esc] stay"
+		lines[1] = "Stop task and quit? y/Enter · n/Esc"
+	} else if m.showHelp {
+		lines[1] = "↑/↓ select · Tab focus · Enter run · q quit · c cancel"
 	}
-	return view
+	if height == 1 {
+		switch {
+		case m.confirmQuit:
+			lines = []string{"quit? y/Enter · n/Esc"}
+		case m.outputEvicted:
+			lines[0] = "Older output discarded · q/c"
+		default:
+			lines = []string{m.phaseName() + " · resize ≥24×13"}
+		}
+	}
+	for i := range lines {
+		lines[i] = clipDisplayText(lines[i], width)
+	}
+	if height > 0 && len(lines) > height {
+		lines = lines[:height]
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (m Model) footerOrPrompt(width int) string {
+	if !m.showHelp && !m.confirmQuit {
+		return clipDisplayText(m.renderFooter(), width)
+	}
+	line := ""
+	if m.showHelp {
+		line = "↑/↓ or j/k navigate · Tab focus · Enter run · c stop · q quit · ? close"
+	} else {
+		line = "Stop active task and quit? [y/Enter] yes · [n/Esc] stay"
+	}
+	if m.outputEvicted {
+		line = "Older output discarded · " + line
+	}
+	return clipDisplayText(line, width)
 }
 
 func (m Model) panel(title, content string, width, height int, focused bool) string {
+	width = max(1, width)
+	height = max(4, height)
+	title = clipDisplayText(title, width)
 	color := lipgloss.Color("#475569")
 	if focused {
 		color = lipgloss.Color("#38bdf8")
 	}
-	style := lipgloss.NewStyle().Width(max(1, width-4)).Height(max(1, height-2)).Border(lipgloss.RoundedBorder()).BorderForeground(color).Padding(0, 1)
+	style := lipgloss.NewStyle().Width(width).Height(height-1).Border(lipgloss.RoundedBorder()).BorderForeground(color).Padding(0, 1)
 	return lipgloss.NewStyle().Render(title) + "\n" + style.Render(content)
 }
 
-func (m Model) renderTasks() string {
-	lines := make([]string, 0, len(m.tasks))
-	for i, spec := range m.tasks {
+func (m Model) renderTasks(width, height int) string {
+	if len(m.tasks) == 0 {
+		return "No tasks configured"
+	}
+	rows := max(1, height)
+	start := max(0, m.selected-rows/2)
+	if start+rows > len(m.tasks) {
+		start = max(0, len(m.tasks)-rows)
+	}
+	end := min(len(m.tasks), start+rows)
+	lines := make([]string, 0, end-start)
+	for i := start; i < end; i++ {
+		spec := m.tasks[i]
 		marker := "  "
 		if i == m.selected {
 			marker = "> "
 		}
-		line := marker + spec.Name
+		line := marker + safeDisplayText(spec.Name)
 		if result, ok := m.lastResults[spec.Name]; ok {
-			line += "  " + resultLabel(result.Status)
+			status := " " + resultLabel(result)
+			if statusWidth := ansi.StringWidth(status); statusWidth < width {
+				line = ansi.Truncate(line, width-statusWidth, "…") + status
+			} else {
+				line = ansi.Truncate(resultLabel(result), width, "…")
+			}
+		} else {
+			line = ansi.Truncate(line, max(1, width), "…")
 		}
 		lines = append(lines, line)
-	}
-	if len(lines) == 0 {
-		return "No tasks configured"
 	}
 	return strings.Join(lines, "\n")
 }
@@ -497,7 +663,7 @@ func (m Model) renderDetails() string {
 	if directory == "" {
 		directory = "."
 	}
-	return fmt.Sprintf("%s — %s  ·  %s", spec.Name, description, directory)
+	return fmt.Sprintf("%s — %s  ·  %s", safeDisplayText(spec.Name), safeDisplayText(description), safeDisplayText(directory))
 }
 
 func (m Model) outputContent() string {
@@ -523,11 +689,27 @@ func (m Model) renderFooter() string {
 	if m.followOutput {
 		following = "following"
 	}
-	truncation := "retained"
-	if m.outputTruncated {
-		truncation = "truncated"
+	if m.outputEvicted {
+		return fmt.Sprintf("Older output discarded · %s · c stop · q quit%s", following, state)
 	}
-	return fmt.Sprintf("Focus: %s  ·  ↑/↓ or j/k  ·  Tab focus  ·  Enter run  ·  c stop  ·  q quit  ·  %s · %s%s", focusName(m.focus), following, truncation, state)
+	return fmt.Sprintf("Focus: %s  ·  ↑/↓ or j/k  ·  Tab focus  ·  Enter run  ·  c stop  ·  q quit  ·  %s · retained%s", focusName(m.focus), following, state)
+}
+
+func safeDisplayText(text string) string {
+	text = ansi.Strip(strings.ToValidUTF8(text, "�"))
+	return strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return ' '
+		}
+		return r
+	}, text)
+}
+
+func clipDisplayText(text string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	return ansi.Truncate(safeDisplayText(text), width, "…")
 }
 
 func (m Model) phaseName() string {
