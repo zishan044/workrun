@@ -153,6 +153,10 @@ func TestCompletionIsReadableByMultipleWaiters(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+	snapshot, changed := handle.Output.SnapshotIfChanged(0)
+	if !changed || len(snapshot.Records) != 1 || snapshot.Records[0].Text != "live final" {
+		t.Fatalf("published output snapshot = %#v, changed=%v", snapshot.Records, changed)
+	}
 	if err := m.CloseAndWait(); err != nil {
 		t.Fatalf("CloseAndWait() error = %v", err)
 	}

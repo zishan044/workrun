@@ -1,8 +1,8 @@
-// Package tui contains the static, simulated task interface. It does not run
-// task processes; a later milestone can connect its run messages to session.
+// Package tui contains the interactive task interface.
 package tui
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"strings"
@@ -13,6 +13,7 @@ import (
 	"charm.land/lipgloss/v2"
 	"github.com/zishan044/workrun/internal/output"
 	"github.com/zishan044/workrun/internal/runner"
+	"github.com/zishan044/workrun/internal/session"
 	"github.com/zishan044/workrun/internal/task"
 )
 
@@ -34,27 +35,37 @@ const (
 	Output
 )
 
-// TickMsg updates elapsed time for an accepted simulated run.
-type TickMsg struct {
+// runAcceptedMsg attaches an asynchronously accepted session run.
+type runAcceptedMsg struct {
 	RequestID uint64
-	At        time.Time
+	Run       *session.Run
+	Err       error
 }
 
-// CompletionMsg supplies a simulated task result. It is ignored if stale.
-type CompletionMsg struct {
+type runFinishedMsg struct {
 	RequestID uint64
 	Result    runner.Result
+}
+
+type refreshMsg struct {
+	RequestID uint64
+	At        time.Time
 }
 
 // Model is the Bubble Tea model for the task screen.
 type Model struct {
 	project       string
 	tasks         []task.Spec
+	manager       *session.Manager
 	selected      int
 	phase         Phase
 	focus         Focus
 	requestID     uint64
 	requestedAt   time.Time
+	requestCancel context.CancelCauseFunc
+	run           *session.Run
+	outputRevision  uint64
+	outputTruncated bool
 	lastResults   map[string]runner.Result
 	outputTask    string
 	output        *output.Store
@@ -67,7 +78,7 @@ type Model struct {
 }
 
 // NewModel constructs a sorted, idle TUI model from validated task specs.
-func NewModel(project string, tasks []task.Spec) Model {
+func NewModel(project string, tasks []task.Spec, manager *session.Manager) Model {
 	ordered := append([]task.Spec(nil), tasks...)
 	for i := range ordered {
 		ordered[i].Argv = append([]string(nil), ordered[i].Argv...)
@@ -83,6 +94,7 @@ func NewModel(project string, tasks []task.Spec) Model {
 	return Model{
 		project:      project,
 		tasks:        ordered,
+		manager:      manager,
 		lastResults:  make(map[string]runner.Result),
 		output:       output.NewStore(output.DefaultLimits()),
 		outputView:   viewport.New(),
@@ -90,47 +102,120 @@ func NewModel(project string, tasks []task.Spec) Model {
 	}
 }
 
-// Init satisfies tea.Model. The simulation starts only in response to Enter.
+// Init satisfies tea.Model. A task starts only in response to Enter.
 func (m Model) Init() tea.Cmd { return nil }
 
-// Update handles model input and synthetic run messages.
+// Update handles model input and asynchronous session messages.
 func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := message.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 		m.resizeOutput()
-	case TickMsg:
-		if msg.RequestID == m.requestID && m.phase == Active {
-			return m, tea.Tick(time.Second, func(now time.Time) tea.Msg {
-				return TickMsg{RequestID: msg.RequestID, At: now}
-			})
+	case runAcceptedMsg:
+		if msg.RequestID != m.requestID || m.phase == Idle {
+			if msg.Run != nil {
+				msg.Run.Cancel(runner.ErrShutdown)
+			}
+			break
 		}
-	case CompletionMsg:
+		if msg.Err != nil {
+			m.recordStartFailure(msg.Err)
+			if m.exitAfterRun {
+				return m, tea.Quit
+			}
+			break
+		}
+		m.run = msg.Run
+		m.output = msg.Run.Output
+		if m.phase != Stopping {
+			m.phase = Active
+		}
+		return m, tea.Batch(m.waitForRun(msg.RequestID), m.refreshAfter(msg.RequestID))
+	case runFinishedMsg:
 		if msg.RequestID != m.requestID || m.phase == Idle {
 			break
 		}
 		result := msg.Result
-		if m.phase == Stopping {
-			result.Status = runner.Cancelled
-			result.StopReason = runner.StopUser
-		}
 		result.TaskName = m.outputTask
 		if result.RequestedAt.IsZero() {
 			result.RequestedAt = m.requestedAt
 		}
 		m.lastResults[result.TaskName] = result
-		_, _ = m.output.StdoutWriter().Write([]byte("Simulated result: " + string(result.Status) + "\n"))
-		m.output.Finish()
-		m.refreshOutput()
+		m.refreshOutputIfChanged()
 		m.phase = Idle
 		m.confirmQuit = false
+		m.run = nil
+		if m.requestCancel != nil {
+			m.requestCancel(nil)
+		}
+		m.requestCancel = nil
 		if m.exitAfterRun {
 			return m, tea.Quit
 		}
+	case refreshMsg:
+		if msg.RequestID != m.requestID || (m.phase != Active && m.phase != Stopping) {
+			break
+		}
+		m.refreshOutputIfChanged()
+		return m, m.refreshAfter(msg.RequestID)
 	case tea.KeyPressMsg:
 		return m.updateKey(msg)
 	}
 	return m, nil
+}
+
+func (m Model) startRun(requestID uint64, ctx context.Context, spec task.Spec) tea.Cmd {
+	return func() tea.Msg {
+		if m.manager == nil {
+			return runAcceptedMsg{RequestID: requestID, Err: fmt.Errorf("task session is unavailable")}
+		}
+		run, err := m.manager.Start(ctx, spec)
+		return runAcceptedMsg{RequestID: requestID, Run: run, Err: err}
+	}
+}
+
+func (m Model) waitForRun(requestID uint64) tea.Cmd {
+	run := m.run
+	return func() tea.Msg {
+		<-run.Done()
+		return runFinishedMsg{RequestID: requestID, Result: run.Result()}
+	}
+}
+
+func (m Model) refreshAfter(requestID uint64) tea.Cmd {
+	return tea.Tick(100*time.Millisecond, func(now time.Time) tea.Msg {
+		return refreshMsg{RequestID: requestID, At: now}
+	})
+}
+
+func (m *Model) refreshOutputIfChanged() {
+	snapshot, changed := m.output.SnapshotIfChanged(m.outputRevision)
+	if !changed {
+		return
+	}
+	m.outputRevision = snapshot.Revision
+	m.outputTruncated = snapshot.EvictedBytes > 0 || snapshot.EvictedRecords > 0
+	var lines []string
+	for _, record := range snapshot.Records {
+		lines = append(lines, record.Text)
+	}
+	m.outputView.SetContent(strings.Join(lines, "\n"))
+	if m.followOutput {
+		m.outputView.GotoBottom()
+	}
+}
+
+func (m *Model) recordStartFailure(err error) {
+	result := runner.Result{TaskName: m.outputTask, Status: runner.StartFailed, ExitCode: -1, Err: err, FinishedAt: time.Now()}
+	m.lastResults[m.outputTask] = result
+	_, _ = fmt.Fprintln(m.output.StderrWriter(), err)
+	m.output.Finish()
+	m.refreshOutputIfChanged()
+	m.phase = Idle
+	if m.requestCancel != nil {
+		m.requestCancel(err)
+	}
+	m.requestCancel = nil
 }
 
 func (m Model) updateKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
@@ -143,7 +228,8 @@ func (m Model) updateKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.confirmQuit = false
 			m.exitAfterRun = true
 			m.phase = Stopping
-			return m, nil // The synthetic run completion represents cleanup.
+			m.cancelRun(runner.ErrShutdown)
+			return m, nil
 		}
 		return m, nil
 	}
@@ -164,6 +250,7 @@ func (m Model) updateKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 		m.exitAfterRun = true
 		m.phase = Stopping
+		m.cancelRun(runner.ErrShutdown)
 		return m, nil
 	}
 	if key == "q" {
@@ -175,6 +262,7 @@ func (m Model) updateKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	}
 	if key == "c" && m.phase != Idle {
 		m.phase = Stopping
+		m.cancelRun(runner.ErrUserCancel)
 		return m, nil
 	}
 	switch key {
@@ -187,20 +275,18 @@ func (m Model) updateKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	case "enter":
 		if m.focus == Tasks && m.phase == Idle && len(m.tasks) != 0 {
 			m.requestID++
-			m.phase = Active
+			m.phase = Launching
 			m.requestedAt = time.Now()
 			m.outputTask = m.tasks[m.selected].Name
 			m.output = output.NewStore(output.DefaultLimits())
-			_, _ = m.output.StdoutWriter().Write([]byte("Simulated run for " + m.outputTask + "\n"))
+			m.outputRevision = 0
+			m.outputTruncated = false
+			ctx, cancel := context.WithCancelCause(context.Background())
+			m.requestCancel = cancel
 			m.followOutput = true
-			m.refreshOutput()
 			id := m.requestID
-			return m, tea.Batch(
-				tea.Tick(time.Second, func(now time.Time) tea.Msg { return TickMsg{RequestID: id, At: now} }),
-				tea.Tick(3*time.Second, func(now time.Time) tea.Msg {
-					return CompletionMsg{RequestID: id, Result: runner.Result{TaskName: m.outputTask, Status: runner.Succeeded, RequestedAt: m.requestedAt, FinishedAt: now}}
-				}),
-			)
+			spec := cloneTask(m.tasks[m.selected])
+			return m, m.startRun(id, ctx, spec)
 		}
 	case "up", "k":
 		if m.focus == Tasks {
@@ -233,6 +319,27 @@ func (m Model) updateKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func (m *Model) cancelRun(cause error) {
+	if m.requestCancel != nil {
+		m.requestCancel(cause)
+	}
+	if m.run != nil {
+		m.run.Cancel(cause)
+	}
+}
+
+func cloneTask(spec task.Spec) task.Spec {
+	spec.Argv = append([]string(nil), spec.Argv...)
+	if spec.Env != nil {
+		env := make(map[string]string, len(spec.Env))
+		for key, value := range spec.Env {
+			env[key] = value
+		}
+		spec.Env = env
+	}
+	return spec
+}
+
 func (m *Model) moveSelection(delta int) {
 	if len(m.tasks) == 0 {
 		return
@@ -247,18 +354,6 @@ func (m *Model) scrollOutput(delta int) {
 		m.outputView.ScrollDown(1)
 	}
 	m.followOutput = m.outputView.AtBottom()
-}
-
-func (m *Model) refreshOutput() {
-	snapshot := m.output.Snapshot()
-	var lines []string
-	for _, record := range snapshot.Records {
-		lines = append(lines, record.Text)
-	}
-	m.outputView.SetContent(strings.Join(lines, "\n"))
-	if m.followOutput {
-		m.outputView.GotoBottom()
-	}
 }
 
 func (m *Model) resizeOutput() {
@@ -397,7 +492,7 @@ func (m Model) renderFooter() string {
 		following = "following"
 	}
 	truncation := "retained"
-	if snapshot := m.output.Snapshot(); snapshot.EvictedBytes > 0 || snapshot.EvictedRecords > 0 {
+	if m.outputTruncated {
 		truncation = "truncated"
 	}
 	return fmt.Sprintf("Focus: %s  ·  ↑/↓ or j/k  ·  Tab focus  ·  Enter run  ·  c stop  ·  q quit  ·  %s · %s%s", focusName(m.focus), following, truncation, state)
@@ -410,7 +505,7 @@ func (m Model) phaseName() string {
 	case Active:
 		return "active"
 	case Stopping:
-		return "stopping"
+		return "Stopping…"
 	default:
 		return "idle"
 	}

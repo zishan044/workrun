@@ -1,21 +1,61 @@
 package tui
 
 import (
+	"context"
+	"errors"
+	"io"
 	"strings"
 	"testing"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/zishan044/workrun/internal/runner"
+	"github.com/zishan044/workrun/internal/session"
 	"github.com/zishan044/workrun/internal/task"
 )
 
-func testModel() Model {
+type modelRunner struct {
+	started   chan struct{}
+	cancelled chan struct{}
+	release   chan struct{}
+}
+
+func newModelRunner() *modelRunner {
+	return &modelRunner{started: make(chan struct{}), cancelled: make(chan struct{}), release: make(chan struct{})}
+}
+
+func (r *modelRunner) Run(ctx context.Context, spec task.Spec, stdout, _ io.Writer) runner.Result {
+	_, _ = io.WriteString(stdout, "live output\n")
+	close(r.started)
+	result := runner.Result{TaskName: spec.Name, ExitCode: 0, ProcessStarted: true}
+	select {
+	case <-ctx.Done():
+		close(r.cancelled)
+		result.Status = runner.Cancelled
+		result.StopReason = runner.StopUser
+		if errors.Is(context.Cause(ctx), runner.ErrShutdown) {
+			result.StopReason = runner.StopShutdown
+		}
+	case <-r.release:
+		result.Status = runner.Succeeded
+	}
+	_, _ = io.WriteString(stdout, "final partial output")
+	return result
+}
+
+func newTestModel() (Model, *modelRunner) {
+	r := newModelRunner()
+	manager := session.NewManager(r)
 	return NewModel("example", []task.Spec{
 		{Name: "zeta", Description: "last", Dir: "/tmp/z"},
-		{Name: "alpha", Description: "first", Dir: "/tmp/a"},
+		{Name: "alpha", Description: "first", Argv: []string{"true"}, Dir: "/tmp/a"},
 		{Name: "middle", Description: "middle", Dir: "/tmp/m"},
-	})
+	}, manager), r
+}
+
+func testModel() Model {
+	m, _ := newTestModel()
+	return m
 }
 
 func press(key string) tea.KeyPressMsg {
@@ -42,8 +82,32 @@ func updateKey(m Model, key string) (Model, tea.Cmd) {
 	return updated.(Model), cmd
 }
 
+func waitFor(t *testing.T, ch <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for task runner")
+	}
+}
+
+func startModelRun(t *testing.T, m Model) (Model, *session.Run) {
+	t.Helper()
+	m, cmd := updateKey(m, "enter")
+	if cmd == nil || m.phase != Launching {
+		t.Fatalf("Enter did not enter launching state: phase=%d cmd=%v", m.phase, cmd != nil)
+	}
+	accepted := cmd().(runAcceptedMsg)
+	updated, followup := m.Update(accepted)
+	m = updated.(Model)
+	if followup == nil || m.phase != Active || m.run == nil {
+		t.Fatalf("run was not accepted: phase=%d run=%v", m.phase, m.run != nil)
+	}
+	return m, m.run
+}
+
 func TestTasksAreSortedAndFocusRoutesNavigation(t *testing.T) {
-	m := testModel()
+	m, _ := newTestModel()
 	if got := []string{m.tasks[0].Name, m.tasks[1].Name, m.tasks[2].Name}; strings.Join(got, ",") != "alpha,middle,zeta" {
 		t.Fatalf("task order = %v", got)
 	}
@@ -63,84 +127,113 @@ func TestTasksAreSortedAndFocusRoutesNavigation(t *testing.T) {
 	}
 }
 
-func TestRunOutputKeepsItsTaskLabelWhenSelectionMoves(t *testing.T) {
-	m := testModel()
-	var cmd tea.Cmd
-	m, cmd = updateKey(m, "enter")
-	if cmd == nil || m.phase != Active || m.outputTask != "alpha" {
-		t.Fatalf("Enter did not start simulated alpha run: phase=%d outputTask=%q", m.phase, m.outputTask)
+func TestEnterStartsRealSessionAndDisplaysFinalOutput(t *testing.T) {
+	m, fake := newTestModel()
+	m, run := startModelRun(t, m)
+	waitFor(t, fake.started)
+	if run.TaskName != "alpha" {
+		t.Fatalf("started task = %q, want alpha", run.TaskName)
 	}
-	m, _ = updateKey(m, "down")
-	if m.selected != 1 || m.outputLabel() != "alpha" {
-		t.Fatalf("selection relabeled output: selected=%d output=%q", m.selected, m.outputLabel())
+	snapshot, _ := run.Output.SnapshotIfChanged(0)
+	if len(snapshot.Records) == 0 {
+		t.Fatal("runner output was not written to session store")
 	}
-	_, _ = m.Update(CompletionMsg{RequestID: m.requestID, Result: runner.Result{Status: runner.Succeeded}})
-	if got := m.lastResults["alpha"].Status; got != runner.Succeeded {
-		t.Fatalf("simulated result status = %q, want %q", got, runner.Succeeded)
+	close(fake.release)
+	waitFor(t, run.Done())
+	updated, cmd := m.Update(runFinishedMsg{RequestID: m.requestID, Result: run.Result()})
+	m = updated.(Model)
+	if cmd != nil || m.phase != Idle || m.lastResults["alpha"].Status != runner.Succeeded {
+		t.Fatalf("completion state: phase=%d status=%q cmd=%v", m.phase, m.lastResults["alpha"].Status, cmd != nil)
 	}
-	if !strings.Contains(m.outputContent(), "Simulated result: succeeded") {
-		t.Fatalf("output missing synthetic completion: %q", m.outputContent())
+	var visible strings.Builder
+	snapshot, _ = m.output.SnapshotIfChanged(0)
+	for _, record := range snapshot.Records {
+		visible.WriteString(record.Text)
 	}
-}
-
-func TestHelpAndQuitConfirmationConsumeKeys(t *testing.T) {
-	m := testModel()
-	m, _ = updateKey(m, "?")
-	m, _ = updateKey(m, "enter")
-	if !m.showHelp || m.phase != Idle {
-		t.Fatalf("Enter escaped help or started a task: help=%v phase=%d", m.showHelp, m.phase)
-	}
-	m, _ = updateKey(m, "esc")
-	m, _ = updateKey(m, "enter")
-	if m.phase != Active {
-		t.Fatalf("Enter did not accept simulated run: phase=%d", m.phase)
-	}
-	m, _ = updateKey(m, "q")
-	m, _ = updateKey(m, "enter")
-	if m.confirmQuit || m.phase != Stopping || !m.exitAfterRun || m.selected != 0 {
-		t.Fatalf("confirmation Enter was not handled as quit: confirm=%v phase=%d exit=%v selected=%d", m.confirmQuit, m.phase, m.exitAfterRun, m.selected)
-	}
-	_, cmd := m.Update(CompletionMsg{RequestID: m.requestID, Result: runner.Result{Status: runner.Succeeded}})
-	if cmd == nil || m.lastResults["alpha"].Status != runner.Cancelled {
-		t.Fatalf("quit completion did not cancel and exit: command=%v result=%q", cmd != nil, m.lastResults["alpha"].Status)
+	if got := visible.String(); !strings.Contains(got, "live output") || !strings.Contains(got, "final partial output") {
+		t.Fatalf("final output missing from retained store: %q", got)
 	}
 }
 
-func TestCancelLeavesTUIOpenAndCtrlCExitsAfterCompletion(t *testing.T) {
-	m := testModel()
-	m, _ = updateKey(m, "enter")
+func TestCancelDuringLaunchCancelsAcceptedRun(t *testing.T) {
+	m, fake := newTestModel()
+	m, start := updateKey(m, "enter")
 	m, _ = updateKey(m, "c")
 	if m.phase != Stopping || m.exitAfterRun {
-		t.Fatalf("ordinary cancel state = phase %d exit %v", m.phase, m.exitAfterRun)
+		t.Fatalf("cancel while launching state: phase=%d exit=%v", m.phase, m.exitAfterRun)
 	}
-	_, cmd := m.Update(CompletionMsg{RequestID: m.requestID, Result: runner.Result{Status: runner.Succeeded}})
+	accepted := start().(runAcceptedMsg)
+	updated, _ := m.Update(accepted)
+	m = updated.(Model)
+	waitFor(t, fake.cancelled)
+	waitFor(t, m.run.Done())
+	updated, cmd := m.Update(runFinishedMsg{RequestID: m.requestID, Result: m.run.Result()})
+	m = updated.(Model)
 	if cmd != nil || m.phase != Idle || m.lastResults["alpha"].Status != runner.Cancelled {
-		t.Fatalf("ordinary cancel did not leave TUI open with cancelled result")
-	}
-	m, _ = updateKey(m, "enter")
-	m, _ = updateKey(m, "ctrl+c")
-	if !m.exitAfterRun || m.phase != Stopping {
-		t.Fatalf("Ctrl+C did not defer exit until run completion")
-	}
-	_, cmd = m.Update(CompletionMsg{RequestID: m.requestID, Result: runner.Result{Status: runner.Succeeded}})
-	if cmd == nil {
-		t.Fatal("Ctrl+C completion did not return a quit command")
+		t.Fatalf("launch cancellation did not finish as cancelled: phase=%d result=%q", m.phase, m.lastResults["alpha"].Status)
 	}
 }
 
-func TestStaleSimulationMessagesAreIgnored(t *testing.T) {
-	m := testModel()
-	m, _ = updateKey(m, "enter")
-	id := m.requestID
+func TestCancelActiveRunLeavesTUIOpen(t *testing.T) {
+	m, fake := newTestModel()
+	m, run := startModelRun(t, m)
+	waitFor(t, fake.started)
 	m, _ = updateKey(m, "c")
-	m, _ = updateKey(m, "enter") // ignored while stopping
-	updated, cmd := m.Update(CompletionMsg{RequestID: id + 1, Result: runner.Result{TaskName: "alpha", Status: runner.Failed}})
-	m = updated.(Model)
-	if cmd != nil || m.phase != Stopping {
-		t.Fatalf("stale completion changed active state: phase=%d", m.phase)
+	if m.phase != Stopping || m.exitAfterRun {
+		t.Fatalf("active cancel state: phase=%d exit=%v", m.phase, m.exitAfterRun)
 	}
-	updated, _ = m.Update(TickMsg{RequestID: id, At: time.Now()})
-	if updated.(Model).phase != Stopping {
-		t.Fatal("tick changed stopping state")
+	waitFor(t, fake.cancelled)
+	waitFor(t, run.Done())
+	updated, cmd := m.Update(runFinishedMsg{RequestID: m.requestID, Result: run.Result()})
+	m = updated.(Model)
+	if cmd != nil || m.phase != Idle || m.lastResults["alpha"].Status != runner.Cancelled {
+		t.Fatalf("cancel completion state: phase=%d result=%q cmd=%v", m.phase, m.lastResults["alpha"].Status, cmd != nil)
+	}
+}
+
+func TestQuitConfirmationWaitsForActiveCleanup(t *testing.T) {
+	m, fake := newTestModel()
+	m, run := startModelRun(t, m)
+	waitFor(t, fake.started)
+	m, _ = updateKey(m, "q")
+	m, _ = updateKey(m, "enter")
+	if !m.exitAfterRun || m.phase != Stopping {
+		t.Fatalf("confirmed quit did not enter stopping state")
+	}
+	waitFor(t, fake.cancelled)
+	waitFor(t, run.Done())
+	updated, cmd := m.Update(runFinishedMsg{RequestID: m.requestID, Result: run.Result()})
+	if cmd == nil {
+		t.Fatal("quit did not return tea.Quit after cleanup")
+	}
+	if updated.(Model).lastResults["alpha"].Status != runner.Cancelled {
+		t.Fatal("quit result did not preserve runner cancellation outcome")
+	}
+}
+
+func TestStaleRunMessagesAreIgnored(t *testing.T) {
+	m, fake := newTestModel()
+	m, _ = startModelRun(t, m)
+	updated, cmd := m.Update(runFinishedMsg{RequestID: m.requestID + 1, Result: runner.Result{Status: runner.Failed}})
+	if cmd != nil || updated.(Model).phase != Active {
+		t.Fatal("stale completion changed active state")
+	}
+	updated, cmd = m.Update(refreshMsg{RequestID: m.requestID - 1, At: time.Now()})
+	if cmd != nil || updated.(Model).phase != Active {
+		t.Fatal("stale refresh changed active state")
+	}
+	close(fake.release)
+	waitFor(t, m.run.Done())
+}
+
+func TestStartFailureReturnsToIdleAndRecordsError(t *testing.T) {
+	manager := session.NewManager(nil)
+	_ = manager.CloseAndWait()
+	m := NewModel("example", []task.Spec{{Name: "alpha"}}, manager)
+	m, start := updateKey(m, "enter")
+	updated, cmd := m.Update(start().(runAcceptedMsg))
+	m = updated.(Model)
+	if cmd != nil || m.phase != Idle || m.lastResults["alpha"].Status != runner.StartFailed {
+		t.Fatalf("start failure state: phase=%d result=%q cmd=%v", m.phase, m.lastResults["alpha"].Status, cmd != nil)
 	}
 }

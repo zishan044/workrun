@@ -2,10 +2,13 @@ package cli
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/zishan044/workrun/internal/tui"
 )
 
 func TestHelpDoesNotRequireProjectConfig(t *testing.T) {
@@ -108,5 +111,44 @@ func TestValidateCommandReportsConfigurationErrorsWithoutUsage(t *testing.T) {
 	}
 	if strings.Contains(stderr.String(), "Run 'workrun --help'") {
 		t.Fatalf("configuration error should not print usage hint: %s", stderr.String())
+	}
+}
+
+func TestTUICommandAppearsInHelp(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := Execute([]string{"--help"}, strings.NewReader(""), &stdout, &stderr, BuildInfo{})
+	if code != 0 || !strings.Contains(stdout.String(), "tui") {
+		t.Fatalf("help does not list tui command: code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+}
+
+func TestRunConfiguredTUILoadsTasksAndPassesLaunchError(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "workrun.yaml")
+	if err := os.WriteFile(configPath, []byte(`version: 1
+tasks:
+  test:
+    command: ["go", "test", "./..."]
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	wantErr := errors.New("terminal unavailable")
+	called := false
+	err := runConfiguredTUI(configPath, func(model tui.Model) error {
+		called = true
+		if !strings.Contains(model.View().Content, "test") {
+			t.Fatalf("loaded model does not show configured task: %q", model.View().Content)
+		}
+		return wantErr
+	})
+	if !called || !errors.Is(err, wantErr) {
+		t.Fatalf("launch callback called=%v, error=%v; want %v", called, err, wantErr)
+	}
+}
+
+func TestTUICommandReportsConfigurationLoadFailure(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := Execute([]string{"--config", filepath.Join(t.TempDir(), "missing.yaml"), "tui"}, strings.NewReader(""), &stdout, &stderr, BuildInfo{})
+	if code != 1 || !strings.Contains(stderr.String(), "read configuration") {
+		t.Fatalf("TUI configuration failure: code=%d stderr=%q", code, stderr.String())
 	}
 }

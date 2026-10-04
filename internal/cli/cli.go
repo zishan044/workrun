@@ -6,8 +6,12 @@ import (
 	"io"
 	"strings"
 
+	tea "charm.land/bubbletea/v2"
 	"github.com/spf13/cobra"
 	"github.com/zishan044/workrun/internal/config"
+	"github.com/zishan044/workrun/internal/runner"
+	"github.com/zishan044/workrun/internal/session"
+	"github.com/zishan044/workrun/internal/tui"
 )
 
 // BuildInfo contains values injected by the release build.
@@ -110,5 +114,32 @@ func newRoot(stdin io.Reader, stdout, stderr io.Writer, build BuildInfo) *cobra.
 			return nil
 		},
 	})
+
+	root.AddCommand(&cobra.Command{
+		Use:   "tui",
+		Short: "Open the interactive task runner",
+		Args:  noArgs("tui"),
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return runConfiguredTUI(configPath, func(model tui.Model) error {
+				_, err := tea.NewProgram(model,
+					tea.WithInput(cmd.InOrStdin()),
+					tea.WithOutput(cmd.OutOrStdout()),
+				).Run()
+				if err != nil {
+					return fmt.Errorf("run TUI: %w", err)
+				}
+				return nil
+			})
+		},
+	})
 	return root
+}
+
+func runConfiguredTUI(configPath string, launch func(tui.Model) error) error {
+	project, err := config.Load(configPath)
+	if err != nil {
+		return err
+	}
+	manager := session.NewManager(runner.New())
+	return launch(tui.NewModel(project.Path, project.Tasks(), manager))
 }
