@@ -5,6 +5,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"unicode"
+	"unicode/utf8"
 )
 
 func snapshot(t *testing.T, store *Store) Snapshot {
@@ -147,4 +149,60 @@ func TestEvictingOpenRecordDropsItsPartialText(t *testing.T) {
 	if len(got.Records) != 1 || got.Records[0].Text != "new" {
 		t.Fatalf("snapshot = %#v", got.Records)
 	}
+}
+
+func FuzzSanitizerBoundsAndRemovesTerminalControls(f *testing.F) {
+	for _, seed := range [][]byte{
+		[]byte("plain text\n"),
+		[]byte("A界e\u0301"),
+		{0xe2, 0x82, 0xac},
+		[]byte("\x1b[31mred\x1b[0m"),
+		[]byte("\x1b]0;title\a"),
+		[]byte("\x1b]52;c;secret\x1b\\"),
+		[]byte("\x1bPunfinished"),
+		{0xff, '\n', 0x00},
+	} {
+		f.Add(seed, uint8(1))
+	}
+
+	f.Fuzz(func(t *testing.T, input []byte, chunk uint8) {
+		// Keep one fuzz iteration small and deterministic while exercising
+		// arbitrary chunk boundaries, including UTF-8 and escape boundaries.
+		if len(input) > 32<<10 {
+			input = input[:32<<10]
+		}
+		limits := DefaultLimits()
+		store := NewStore(limits)
+		writer := store.StdoutWriter()
+		chunkSize := int(chunk) + 1
+		for offset := 0; offset < len(input); {
+			end := offset + chunkSize
+			if end > len(input) {
+				end = len(input)
+			}
+			if _, err := writer.Write(input[offset:end]); err != nil {
+				t.Fatalf("Write() error: %v", err)
+			}
+			offset = end
+		}
+		if len(store.stdout.parser.Data()) > ansiDataLimit || len(store.stdout.line.String()) > limits.MaxRecordBytes || len(store.stdout.pending) >= utf8.UTFMax {
+			t.Fatal("sanitizer retained parser or partial-line data beyond its bound")
+		}
+		store.Finish()
+
+		got, _ := store.SnapshotIfChanged(0)
+		if got.RetainedBytes > limits.MaxBytes || len(got.Records) > limits.MaxRecords {
+			t.Fatalf("store exceeded bounds: bytes=%d records=%d", got.RetainedBytes, len(got.Records))
+		}
+		for _, record := range got.Records {
+			if !utf8.ValidString(record.Text) || len(record.Text) > limits.MaxRecordBytes {
+				t.Fatalf("invalid or oversized display record: %#v", record)
+			}
+			for _, r := range record.Text {
+				if !unicode.IsPrint(r) {
+					t.Fatalf("display record contains terminal control or nonprintable rune %U", r)
+				}
+			}
+		}
+	})
 }

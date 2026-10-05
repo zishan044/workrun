@@ -118,6 +118,26 @@ func TestRunMergesEnvironmentAndPreservesEmptyOverride(t *testing.T) {
 	}
 }
 
+func TestRunTaskPATHOverrideDoesNotChangeExecutableLookup(t *testing.T) {
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", filepath.Dir(executable))
+
+	spec := helperSpec("env", "PATH")
+	spec.Argv[0] = filepath.Base(executable)
+	spec.Env["PATH"] = "child-only-path"
+	var stdout bytes.Buffer
+	result := New().Run(context.Background(), spec, &stdout, io.Discard)
+	if result.Status != Succeeded {
+		t.Fatalf("Run status = %q, want %q (err: %v)", result.Status, Succeeded, result.Err)
+	}
+	if got := stdout.String(); got != "child-only-path" {
+		t.Fatalf("child PATH = %q, want task override", got)
+	}
+}
+
 func TestRunKeepsOutputStreamsSeparate(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	result := New().Run(context.Background(), helperSpec("streams"), &stdout, &stderr)
